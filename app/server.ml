@@ -255,21 +255,29 @@ let save_to_disk dir (((job : Builder.script_job), uuid, _, _, _, _, _) as full)
 let upload happy_eyeballs url dir full =
   let body = Cstruct.to_string (Builder.Asn.exec_to_cs full) in
   let body_f _ acc data = Lwt.return (acc ^ data) in
-  Http_lwt_client.request ~happy_eyeballs ~meth:`POST ~body url body_f "" >|= function
-  | Ok (resp, body) ->
-    if Http_lwt_client.Status.is_successful resp.Http_lwt_client.status then begin
-      Logs.info (fun m -> m "successful upload (HTTP %s)"
-                    (Http_lwt_client.Status.to_string resp.Http_lwt_client.status));
-      Ok ()
-    end else begin
-      Logs.err (fun m -> m "upload failed (HTTP %s, body: %s), saving to %a"
-                   (Http_lwt_client.Status.to_string resp.Http_lwt_client.status)
-                   body Fpath.pp dir);
-      save_to_disk dir full
-    end
-  | Error `Msg e ->
-    Logs.err (fun m -> m "upload failed %s, saving to %a" e Fpath.pp dir);
-    save_to_disk dir full
+  let rec loop = function
+    | 0 ->
+      Logs.err (fun m -> m "saving to %a" Fpath.pp dir);
+      Lwt.return (save_to_disk dir full)
+    | remaining_retries ->
+      Http_lwt_client.request ~happy_eyeballs ~meth:`POST ~body url body_f "" >>= function
+      | Ok (resp, body) ->
+        if Http_lwt_client.Status.is_successful resp.Http_lwt_client.status then begin
+          Logs.info (fun m -> m "successful upload (HTTP %s)"
+                        (Http_lwt_client.Status.to_string resp.Http_lwt_client.status));
+          Lwt.return (Ok ())
+        end else begin
+          Logs.err (fun m -> m "upload failed (HTTP %s, body: %s)"
+                       (Http_lwt_client.Status.to_string resp.Http_lwt_client.status)
+                       body);
+          (* XXX: is it worth retrying on non-OK response? *)
+          loop 0
+        end
+      | Error `Msg e ->
+        Logs.err (fun m -> m "upload failed %s" e);
+        loop (pred remaining_retries)
+  in
+  loop 3
 
 let job_finished state uuid res data =
   let r = UM.find_opt uuid state.running in
